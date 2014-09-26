@@ -70,18 +70,18 @@ public class RemoteViewsActionTest {
 
   private TestableRemoteViewsAction createAction(int errorResId) {
     return new TestableRemoteViewsAction(picasso, null, remoteViews, 1, errorResId, false,
-        URI_KEY_1);
+        URI_KEY_1, null);
   }
 
   private Picasso createPicasso() {
-    return new Picasso(Robolectric.application, mock(Dispatcher.class), Cache.NONE, null, IDENTITY,
-        mock(Stats.class), true);
+    return new Picasso(Robolectric.application, mock(Dispatcher.class), Cache.NONE, null,
+        IDENTITY, null, mock(Stats.class), false, false);
   }
 
   static class TestableRemoteViewsAction extends RemoteViewsAction {
     TestableRemoteViewsAction(Picasso picasso, Request data, RemoteViews remoteViews, int viewId,
-        int errorResId, boolean skipCache, String key) {
-      super(picasso, data, remoteViews, viewId, errorResId, skipCache, key);
+        int errorResId, boolean skipCache, String key, String tag) {
+      super(picasso, data, remoteViews, viewId, errorResId, skipCache, key, tag);
     }
 
     @Override void update() {

@@ -24,8 +24,11 @@ import android.os.Looper;
 import android.os.Message;
 import android.os.Process;
 import android.widget.ImageView;
+import android.widget.RemoteViews;
 import java.io.File;
 import java.lang.ref.ReferenceQueue;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
@@ -34,8 +37,16 @@ import java.util.concurrent.ExecutorService;
 import static android.os.Process.THREAD_PRIORITY_BACKGROUND;
 import static com.squareup.picasso.Action.RequestWeakReference;
 import static com.squareup.picasso.Dispatcher.HUNTER_BATCH_COMPLETE;
+import static com.squareup.picasso.Dispatcher.REQUEST_BATCH_RESUME;
 import static com.squareup.picasso.Dispatcher.REQUEST_GCED;
+import static com.squareup.picasso.Picasso.LoadedFrom.MEMORY;
+import static com.squareup.picasso.Utils.OWNER_MAIN;
 import static com.squareup.picasso.Utils.THREAD_PREFIX;
+import static com.squareup.picasso.Utils.VERB_COMPLETED;
+import static com.squareup.picasso.Utils.VERB_ERRORED;
+import static com.squareup.picasso.Utils.VERB_RESUMED;
+import static com.squareup.picasso.Utils.checkMain;
+import static com.squareup.picasso.Utils.log;
 
 /**
  * Image downloading, transformation, and caching manager.
@@ -80,6 +91,18 @@ public class Picasso {
     };
   }
 
+  /**
+   * The priority of a request.
+   *
+   * @see RequestCreator#priority(Priority)
+   */
+  public enum Priority {
+    LOW,
+    NORMAL,
+    HIGH
+  }
+
+  static final String TAG = "Picasso";
   static final Handler HANDLER = new Handler(Looper.getMainLooper()) {
     @Override public void handleMessage(Message msg) {
       switch (msg.what) {
@@ -97,6 +120,13 @@ public class Picasso {
           action.picasso.cancelExistingRequest(action.getTarget());
           break;
         }
+        case REQUEST_BATCH_RESUME:
+          @SuppressWarnings("unchecked") List<Action> batch = (List<Action>) msg.obj;
+          for (int i = 0, n = batch.size(); i < n; i++) {
+            Action action = batch.get(i);
+            action.picasso.resumeAction(action);
+          }
+          break;
         default:
           throw new AssertionError("Unknown handler message received: " + msg.what);
       }
@@ -108,6 +138,7 @@ public class Picasso {
   private final Listener listener;
   private final RequestTransformer requestTransformer;
   private final CleanupThread cleanupThread;
+  private final List<RequestHandler> requestHandlers;
 
   final Context context;
   final Dispatcher dispatcher;
@@ -118,19 +149,41 @@ public class Picasso {
   final ReferenceQueue<Object> referenceQueue;
 
   boolean indicatorsEnabled;
+  volatile boolean loggingEnabled;
+
   boolean shutdown;
 
   Picasso(Context context, Dispatcher dispatcher, Cache cache, Listener listener,
-      RequestTransformer requestTransformer, Stats stats, boolean indicatorsEnabled) {
+      RequestTransformer requestTransformer, List<RequestHandler> extraRequestHandlers,
+      Stats stats, boolean indicatorsEnabled, boolean loggingEnabled) {
     this.context = context;
     this.dispatcher = dispatcher;
     this.cache = cache;
     this.listener = listener;
     this.requestTransformer = requestTransformer;
+
+    final int extraCount = (extraRequestHandlers != null ? extraRequestHandlers.size() : 0);
+    final List<RequestHandler> allRequestHandlers = new ArrayList<RequestHandler>(7 + extraCount);
+    // ResourceRequestHandler needs to be the first in the list to avoid
+    // forcing other RequestHandlers to perform null checks on request.uri
+    // to cover the (request.resourceId != 0) case.
+    allRequestHandlers.add(new ResourceRequestHandler(context));
+    if (extraRequestHandlers != null) {
+      allRequestHandlers.addAll(extraRequestHandlers);
+    }
+    allRequestHandlers.add(new ContactsPhotoRequestHandler(context));
+    allRequestHandlers.add(new MediaStoreRequestHandler(context));
+    allRequestHandlers.add(new ContentStreamRequestHandler(context));
+    allRequestHandlers.add(new AssetRequestHandler(context));
+    allRequestHandlers.add(new FileRequestHandler(context));
+    allRequestHandlers.add(new NetworkRequestHandler(dispatcher.downloader, stats));
+    requestHandlers = Collections.unmodifiableList(allRequestHandlers);
+
     this.stats = stats;
     this.targetToAction = new WeakHashMap<Object, Action>();
     this.targetToDeferredRequestCreator = new WeakHashMap<ImageView, DeferredRequestCreator>();
     this.indicatorsEnabled = indicatorsEnabled;
+    this.loggingEnabled = loggingEnabled;
     this.referenceQueue = new ReferenceQueue<Object>();
     this.cleanupThread = new CleanupThread(referenceQueue, HANDLER);
     this.cleanupThread.start();
@@ -144,6 +197,53 @@ public class Picasso {
   /** Cancel any existing requests for the specified {@link Target} instance. */
   public void cancelRequest(Target target) {
     cancelExistingRequest(target);
+  }
+
+  /**
+   * Cancel any existing requests for the specified {@link RemoteViews} target with the given {@code
+   * viewId}.
+   */
+  public void cancelRequest(RemoteViews remoteViews, int viewId) {
+    cancelExistingRequest(new RemoteViewsAction.RemoteViewsTarget(remoteViews, viewId));
+  }
+
+  /**
+   * Cancel any existing requests with given tag. You can set a tag
+   * on new requests with {@link RequestCreator#tag(Object)}.
+   *
+   * @see RequestCreator#tag(Object)
+   */
+  public void cancelTag(Object tag) {
+    checkMain();
+    List<Action> actions = new ArrayList<Action>(targetToAction.values());
+    for (int i = 0, n = actions.size(); i < n; i++) {
+      Action action = actions.get(i);
+      if (action.getTag().equals(tag)) {
+        cancelExistingRequest(action.getTarget());
+      }
+    }
+  }
+
+  /**
+   * Pause existing requests with the given tag. Use {@link #resumeTag(Object)}
+   * to resume requests with the given tag.
+   *
+   * @see #resumeTag(Object)
+   * @see RequestCreator#tag(Object)
+   */
+  public void pauseTag(Object tag) {
+    dispatcher.dispatchPauseTag(tag);
+  }
+
+  /**
+   * Resume paused requests with the given tag. Use {@link #pauseTag(Object)}
+   * to pause requests with the given tag.
+   *
+   * @see #pauseTag(Object)
+   * @see RequestCreator#tag(Object)
+   */
+  public void resumeTag(Object tag) {
+    dispatcher.dispatchResumeTag(tag);
   }
 
   /**
@@ -221,16 +321,19 @@ public class Picasso {
   }
 
   /**
-   * @deprecated Use {@link #areIndicatorsEnabled()} instead.
    * {@code true} if debug display, logging, and statistics are enabled.
+   * <p>
+   * @deprecated Use {@link #areIndicatorsEnabled()} and {@link #isLoggingEnabled()} instead.
    */
   @SuppressWarnings("UnusedDeclaration") @Deprecated public boolean isDebugging() {
-    return areIndicatorsEnabled();
+    return areIndicatorsEnabled() && isLoggingEnabled();
   }
 
   /**
-   * @deprecated Use {@link #setIndicatorsEnabled(boolean)} instead.
    * Toggle whether debug display, logging, and statistics are enabled.
+   * <p>
+   * @deprecated Use {@link #setIndicatorsEnabled(boolean)} and {@link #setLoggingEnabled(boolean)}
+   * instead.
    */
   @SuppressWarnings("UnusedDeclaration") @Deprecated public void setDebugging(boolean debugging) {
     setIndicatorsEnabled(debugging);
@@ -247,7 +350,23 @@ public class Picasso {
   }
 
   /**
+   * Toggle whether debug logging is enabled.
+   * <p>
+   * <b>WARNING:</b> Enabling this will result in excessive object allocation. This should be only
+   * be used for debugging Picasso behavior. Do NOT pass {@code BuildConfig.DEBUG}.
+   */
+  public void setLoggingEnabled(boolean enabled) {
+    loggingEnabled = enabled;
+  }
+
+  /** {@code true} if debug logging is enabled. */
+  public boolean isLoggingEnabled() {
+    return loggingEnabled;
+  }
+
+  /**
    * Creates a {@link StatsSnapshot} of the current stats for this instance.
+   * <p>
    * <b>NOTE:</b> The snapshot may not always be completely up-to-date if requests are still in
    * progress.
    */
@@ -274,6 +393,10 @@ public class Picasso {
     shutdown = true;
   }
 
+  List<RequestHandler> getRequestHandlers() {
+    return requestHandlers;
+  }
+
   Request transformRequest(Request request) {
     Request transformed = requestTransformer.transformRequest(request);
     if (transformed == null) {
@@ -291,7 +414,8 @@ public class Picasso {
 
   void enqueueAndSubmit(Action action) {
     Object target = action.getTarget();
-    if (target != null) {
+    if (target != null && targetToAction.get(target) != action) {
+      // This will also check we are on the main thread.
       cancelExistingRequest(target);
       targetToAction.put(target, action);
     }
@@ -345,22 +469,52 @@ public class Picasso {
     }
   }
 
+  void resumeAction(Action action) {
+    Bitmap bitmap = null;
+    if (!action.skipCache) {
+      bitmap = quickMemoryCacheCheck(action.getKey());
+    }
+
+    if (bitmap != null) {
+      // Resumed action is cached, complete immediately.
+      deliverAction(bitmap, MEMORY, action);
+      if (loggingEnabled) {
+        log(OWNER_MAIN, VERB_COMPLETED, action.request.logId(), "from " + MEMORY);
+      }
+    } else {
+      // Re-submit the action to the executor.
+      enqueueAndSubmit(action);
+      if (loggingEnabled) {
+        log(OWNER_MAIN, VERB_RESUMED, action.request.logId());
+      }
+    }
+  }
+
   private void deliverAction(Bitmap result, LoadedFrom from, Action action) {
     if (action.isCancelled()) {
       return;
     }
-    targetToAction.remove(action.getTarget());
+    if (!action.willReplay()) {
+      targetToAction.remove(action.getTarget());
+    }
     if (result != null) {
       if (from == null) {
         throw new AssertionError("LoadedFrom cannot be null.");
       }
       action.complete(result, from);
+      if (loggingEnabled) {
+        log(OWNER_MAIN, VERB_COMPLETED, action.request.logId(), "from " + from);
+      }
     } else {
       action.error();
+      if (loggingEnabled) {
+        log(OWNER_MAIN, VERB_ERRORED, action.request.logId());
+      }
     }
   }
 
   private void cancelExistingRequest(Object target) {
+    checkMain();
     Action action = targetToAction.remove(target);
     if (action != null) {
       action.cancel();
@@ -429,7 +583,11 @@ public class Picasso {
    */
   public static Picasso with(Context context) {
     if (singleton == null) {
-      singleton = new Builder(context).build();
+      synchronized (Picasso.class) {
+        if (singleton == null) {
+          singleton = new Builder(context).build();
+        }
+      }
     }
     return singleton;
   }
@@ -443,8 +601,10 @@ public class Picasso {
     private Cache cache;
     private Listener listener;
     private RequestTransformer transformer;
+    private List<RequestHandler> requestHandlers;
 
     private boolean indicatorsEnabled;
+    private boolean loggingEnabled;
 
     /** Start building a new {@link Picasso} instance. */
     public Builder(Context context) {
@@ -519,6 +679,21 @@ public class Picasso {
       return this;
     }
 
+    /** Register a {@link RequestHandler}. */
+    public Builder addRequestHandler(RequestHandler requestHandler) {
+      if (requestHandler == null) {
+        throw new IllegalArgumentException("RequestHandler must not be null.");
+      }
+      if (requestHandlers == null) {
+        requestHandlers = new ArrayList<RequestHandler>();
+      }
+      if (requestHandlers.contains(requestHandler)) {
+        throw new IllegalStateException("RequestHandler already registered.");
+      }
+      requestHandlers.add(requestHandler);
+      return this;
+    }
+
     /**
      * @deprecated Use {@link #indicatorsEnabled(boolean)} instead.
      * Whether debugging is enabled or not.
@@ -527,8 +702,20 @@ public class Picasso {
       return indicatorsEnabled(debugging);
     }
 
+    /** Toggle whether to display debug indicators on images. */
     public Builder indicatorsEnabled(boolean enabled) {
       this.indicatorsEnabled = enabled;
+      return this;
+    }
+
+    /**
+     * Toggle whether debug logging is enabled.
+     * <p>
+     * <b>WARNING:</b> Enabling this will result in excessive object allocation. This should be only
+     * be used for debugging purposes. Do NOT pass {@code BuildConfig.DEBUG}.
+     */
+    public Builder loggingEnabled(boolean enabled) {
+      this.loggingEnabled = enabled;
       return this;
     }
 
@@ -553,8 +740,8 @@ public class Picasso {
 
       Dispatcher dispatcher = new Dispatcher(context, service, HANDLER, downloader, cache, stats);
 
-      return new Picasso(context, dispatcher, cache, listener, transformer, stats,
-          indicatorsEnabled);
+      return new Picasso(context, dispatcher, cache, listener, transformer,
+          requestHandlers, stats, indicatorsEnabled, loggingEnabled);
     }
   }
 

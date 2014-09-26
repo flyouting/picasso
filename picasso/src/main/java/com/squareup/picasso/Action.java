@@ -17,6 +17,7 @@ package com.squareup.picasso;
 
 import android.graphics.Bitmap;
 import android.graphics.drawable.Drawable;
+import com.squareup.picasso.Picasso.Priority;
 import java.lang.ref.ReferenceQueue;
 import java.lang.ref.WeakReference;
 
@@ -31,26 +32,29 @@ abstract class Action<T> {
   }
 
   final Picasso picasso;
-  final Request data;
+  final Request request;
   final WeakReference<T> target;
   final boolean skipCache;
   final boolean noFade;
   final int errorResId;
   final Drawable errorDrawable;
   final String key;
+  final Object tag;
 
+  boolean willReplay;
   boolean cancelled;
 
-  Action(Picasso picasso, T target, Request data, boolean skipCache, boolean noFade,
-      int errorResId, Drawable errorDrawable, String key) {
+  Action(Picasso picasso, T target, Request request, boolean skipCache, boolean noFade,
+      int errorResId, Drawable errorDrawable, String key, Object tag) {
     this.picasso = picasso;
-    this.data = data;
+    this.request = request;
     this.target = new RequestWeakReference<T>(this, target, picasso.referenceQueue);
     this.skipCache = skipCache;
     this.noFade = noFade;
     this.errorResId = errorResId;
     this.errorDrawable = errorDrawable;
     this.key = key;
+    this.tag = (tag != null ? tag : this);
   }
 
   abstract void complete(Bitmap result, Picasso.LoadedFrom from);
@@ -61,8 +65,8 @@ abstract class Action<T> {
     cancelled = true;
   }
 
-  Request getData() {
-    return data;
+  Request getRequest() {
+    return request;
   }
 
   T getTarget() {
@@ -77,7 +81,19 @@ abstract class Action<T> {
     return cancelled;
   }
 
+  boolean willReplay() {
+    return willReplay;
+  }
+
   Picasso getPicasso() {
     return picasso;
+  }
+
+  Priority getPriority() {
+    return request.priority;
+  }
+
+  Object getTag() {
+    return tag;
   }
 }

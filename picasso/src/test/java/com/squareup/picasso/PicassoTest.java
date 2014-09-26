@@ -18,6 +18,7 @@ package com.squareup.picasso;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.widget.ImageView;
+import android.widget.RemoteViews;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.concurrent.ExecutorService;
@@ -31,6 +32,7 @@ import org.robolectric.annotation.Config;
 
 import static com.squareup.picasso.Picasso.Listener;
 import static com.squareup.picasso.Picasso.LoadedFrom.MEMORY;
+import static com.squareup.picasso.RemoteViewsAction.RemoteViewsTarget;
 import static com.squareup.picasso.TestUtils.BITMAP_1;
 import static com.squareup.picasso.TestUtils.URI_1;
 import static com.squareup.picasso.TestUtils.URI_KEY_1;
@@ -60,6 +62,7 @@ public class PicassoTest {
   @Mock Downloader downloader;
   @Mock Dispatcher dispatcher;
   @Mock Picasso.RequestTransformer transformer;
+  @Mock RequestHandler requestHandler;
   @Mock Cache cache;
   @Mock Listener listener;
   @Mock Stats stats;
@@ -68,11 +71,12 @@ public class PicassoTest {
 
   @Before public void setUp() {
     initMocks(this);
-    picasso = new Picasso(context, dispatcher, cache, listener, transformer, stats, false);
+    picasso = new Picasso(context, dispatcher, cache, listener, transformer, null,
+        stats, false, false);
   }
 
   @Test public void submitWithNullTargetInvokesDispatcher() throws Exception {
-    Action action = mockAction(URI_KEY_1, URI_1, null);
+    Action action = mockAction(URI_KEY_1, URI_1);
     picasso.enqueueAndSubmit(action);
     assertThat(picasso.targetToAction).isEmpty();
     verify(dispatcher).dispatchSubmit(action);
@@ -84,6 +88,16 @@ public class PicassoTest {
     picasso.enqueueAndSubmit(action);
     assertThat(picasso.targetToAction).hasSize(1);
     verify(dispatcher).dispatchSubmit(action);
+  }
+
+  @Test public void submitWithSameActionDoesNotCancel() throws Exception {
+    Action action = mockAction(URI_KEY_1, URI_1, mockImageViewTarget());
+    picasso.enqueueAndSubmit(action);
+    verify(dispatcher).dispatchSubmit(action);
+    assertThat(picasso.targetToAction).hasSize(1).containsValue(action);
+    picasso.enqueueAndSubmit(action);
+    verify(action, never()).cancel();
+    verify(dispatcher, never()).dispatchCancel(action);
   }
 
   @Test public void quickMemoryCheckReturnsBitmapIfInCache() throws Exception {
@@ -133,6 +147,19 @@ public class PicassoTest {
     verify(action).complete(BITMAP_1, MEMORY);
   }
 
+  @Test public void completeWithReplayDoesNotRemove() throws Exception {
+    Action action = mockAction(URI_KEY_1, URI_1, mockImageViewTarget());
+    when(action.willReplay()).thenReturn(true);
+    BitmapHunter hunter = mockHunter(URI_KEY_1, BITMAP_1, false);
+    when(hunter.getLoadedFrom()).thenReturn(MEMORY);
+    when(hunter.getAction()).thenReturn(action);
+    picasso.enqueueAndSubmit(action);
+    assertThat(picasso.targetToAction).hasSize(1);
+    picasso.complete(hunter);
+    assertThat(picasso.targetToAction).hasSize(1);
+    verify(action).complete(BITMAP_1, MEMORY);
+  }
+
   @Test public void completeDeliversToSingleAndMultiple() throws Exception {
     Action action = mockAction(URI_KEY_1, URI_1, mockImageViewTarget());
     Action action2 = mockAction(URI_KEY_1, URI_1, mockImageViewTarget());
@@ -160,12 +187,22 @@ public class PicassoTest {
     boolean caught = false;
     try {
       picasso.complete(hunter);
-    } catch (AssertionError error) {
-      caught = true;
-    }
-    if (!caught) {
       fail("Calling complete() with null LoadedFrom should throw");
+    } catch (AssertionError expected) {
     }
+  }
+
+  @Test public void resumeActionTriggersSubmitOnPausedAction() {
+    Action action = mockAction(URI_KEY_1, URI_1);
+    picasso.resumeAction(action);
+    verify(dispatcher).dispatchSubmit(action);
+  }
+
+  @Test public void resumeActionImmediatelyCompletesCachedRequest() {
+    when(cache.get(URI_KEY_1)).thenReturn(BITMAP_1);
+    Action action = mockAction(URI_KEY_1, URI_1);
+    picasso.resumeAction(action);
+    verify(action).complete(BITMAP_1, MEMORY);
   }
 
   @Test public void cancelExistingRequestWithUnknownTarget() throws Exception {
@@ -201,6 +238,20 @@ public class PicassoTest {
     picasso.enqueueAndSubmit(action);
     assertThat(picasso.targetToAction).hasSize(1);
     picasso.cancelRequest(target);
+    assertThat(picasso.targetToAction).isEmpty();
+    verify(action).cancel();
+    verify(dispatcher).dispatchCancel(action);
+  }
+
+  @Test public void cancelExistingRequestWithRemoteViewTarget() throws Exception {
+    int layoutId = 0;
+    int viewId = 1;
+    RemoteViews remoteViews = new RemoteViews("packageName", layoutId);
+    RemoteViewsTarget target = new RemoteViewsTarget(remoteViews, viewId);
+    Action action = mockAction(URI_KEY_1, URI_1, target);
+    picasso.enqueueAndSubmit(action);
+    assertThat(picasso.targetToAction).hasSize(1);
+    picasso.cancelRequest(remoteViews, viewId);
     assertThat(picasso.targetToAction).isEmpty();
     verify(action).cancel();
     verify(dispatcher).dispatchCancel(action);
@@ -351,6 +402,29 @@ public class PicassoTest {
       fail("Setting request transformer twice should throw exception.");
     } catch (IllegalStateException expected) {
     }
+  }
+
+  @Test public void builderInvalidRequestHandler() throws Exception {
+    try {
+      new Picasso.Builder(context).addRequestHandler(null);
+      fail("Null request handler should throw exception.");
+    } catch (IllegalArgumentException expected) {
+    }
+    try {
+      new Picasso.Builder(context).addRequestHandler(requestHandler).addRequestHandler(requestHandler);
+      fail("Registering same request handler twice should throw exception.");
+    } catch (IllegalStateException expected) {
+    }
+  }
+
+  @Test public void builderWithoutRequestHandler() throws Exception {
+    Picasso picasso = new Picasso.Builder(Robolectric.application).build();
+    assertThat(picasso.getRequestHandlers()).isNotEmpty().doesNotContain(requestHandler);
+  }
+
+  @Test public void builderWithRequestHandler() throws Exception {
+    Picasso picasso = new Picasso.Builder(Robolectric.application).addRequestHandler(requestHandler).build();
+    assertThat(picasso.getRequestHandlers()).isNotNull().isNotEmpty().contains(requestHandler);
   }
 
   @Test public void builderInvalidContext() throws Exception {
